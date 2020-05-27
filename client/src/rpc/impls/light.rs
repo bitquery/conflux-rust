@@ -494,6 +494,7 @@ impl Cfx for CfxHandler {
         fn accumulate_interest_rate(&self, num: Option<EpochNumber>) -> RpcResult<RpcU256>;
         fn interest_rate(&self, num: Option<EpochNumber>) -> RpcResult<RpcU256>;
         fn check_balance_against_transaction(&self, account_addr: RpcH160, contract_addr: RpcH160, gas_limit: RpcU256, gas_price: RpcU256, storage_limit: RpcU256, epoch: Option<EpochNumber>) -> RpcResult<CheckBalanceAgainstTransactionResponse>;
+        fn transaction_receipts_by_block_hash(&self, block_hash: RpcH256) -> BoxFuture<Vec<RpcReceipt>>;
     }
 }
 
