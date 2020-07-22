@@ -18,6 +18,7 @@ use crate::{
             GetBlockHeadersResponse, NewBlockHashes, StatusDeprecatedV1,
             StatusV2, TransactionDigests,
         },
+        request_manager::{try_get_block_hashes, Request},
         state::SnapshotChunkSync,
         synchronization_phases::{SyncPhaseType, SynchronizationPhaseManager},
         synchronization_state::PeerFilter,
@@ -75,6 +76,11 @@ pub const CHECK_RPC_REQUEST_TIMER: TimerToken = 11;
 
 const MAX_TXS_BYTES_TO_PROPAGATE: usize = 1024 * 1024; // 1MB
 
+/// The maximum allowed gap between `best_epoch` and `latest_epoch_requested`.
+const EPOCH_SYNC_MAX_GAP: u64 = 20000;
+/// If not future epochs can be requested because of `EPOCH_SYNC_MAX_GAP`,
+/// after waiting this timeout we'll request from `best_epoch` again.
+const EPOCH_SYNC_RESTART_TIMEOUT_S: u64 = 60 * 10;
 const EPOCH_SYNC_MAX_INFLIGHT: u64 = 300;
 const EPOCH_SYNC_BATCH_SIZE: u64 = 30;
 
@@ -221,7 +227,13 @@ impl TaskSize for LocalMessageTask {}
 struct FutureBlockContainerInner {
     capacity: usize,
     size: usize,
-    container: BTreeMap<u64, HashMap<H256, BlockHeader>>,
+    container: BTreeMap<u64, HashSet<H256>>,
+
+    // The value is a tuple of the header corresponding to a hash and the peer
+    // that we receive this header from. Since a header is only broadcast
+    // after receiving its body, we should be able to receive the block body
+    // from the peer successfully.
+    hash_to_header_and_peer: HashMap<H256, (BlockHeader, NodeId)>,
 }
 
 impl FutureBlockContainerInner {
@@ -230,6 +242,7 @@ impl FutureBlockContainerInner {
             capacity,
             size: 0,
             container: BTreeMap::new(),
+            hash_to_header_and_peer: Default::default(),
         }
     }
 }
@@ -245,14 +258,21 @@ impl FutureBlockContainer {
         }
     }
 
-    pub fn insert(&self, header: BlockHeader) {
-        let mut inner = self.inner.write();
+    pub fn insert(&self, header: BlockHeader, peer: NodeId) {
+        let mut inner = &mut *self.inner.write();
+        let header_hash = header.hash();
+        if inner.hash_to_header_and_peer.contains_key(&header_hash) {
+            return;
+        }
         let entry = inner
             .container
             .entry(header.timestamp())
-            .or_insert(HashMap::new());
-        if !entry.contains_key(&header.hash()) {
-            entry.insert(header.hash(), header);
+            .or_insert(HashSet::new());
+        if !entry.contains(&header_hash) {
+            entry.insert(header_hash);
+            inner
+                .hash_to_header_and_peer
+                .insert(header_hash, (header, peer));
             inner.size += 1;
         }
 
@@ -265,8 +285,9 @@ impl FutureBlockContainer {
                     continue;
                 }
 
-                let hash = *entry.1.iter().find(|_| true).unwrap().0;
+                let hash = *entry.1.iter().next().unwrap();
                 entry.1.remove(&hash);
+                inner.hash_to_header_and_peer.remove(&hash);
                 removed = true;
 
                 if entry.1.is_empty() {
@@ -285,7 +306,7 @@ impl FutureBlockContainer {
         }
     }
 
-    pub fn get_before(&self, timestamp: u64) -> Vec<BlockHeader> {
+    pub fn get_before(&self, timestamp: u64) -> Vec<(BlockHeader, NodeId)> {
         let mut inner = self.inner.write();
         let mut result = Vec::new();
 
@@ -302,15 +323,25 @@ impl FutureBlockContainer {
 
             let entry = inner.container.remove(&slot.unwrap()).unwrap();
 
-            for (_, header) in entry {
-                result.push(header);
+            for header_hash in entry {
+                result.push(inner.hash_to_header_and_peer.remove(&header_hash).expect(
+                    "hash and header are inserted/removed together atomically",
+                ));
             }
         }
 
         result
     }
+
+    pub fn contains(&self, header_hash: &H256) -> bool {
+        self.inner
+            .read()
+            .hash_to_header_and_peer
+            .contains_key(header_hash)
+    }
 }
 
+#[derive(DeriveMallocSizeOf)]
 pub struct SynchronizationProtocolHandler {
     pub protocol_version: ProtocolVersion,
 
@@ -318,18 +349,22 @@ pub struct SynchronizationProtocolHandler {
     pub graph: SharedSynchronizationGraph,
     pub syn: Arc<SynchronizationState>,
     pub request_manager: Arc<RequestManager>,
-    pub latest_epoch_requested: Mutex<u64>,
-    pub future_blocks: FutureBlockContainer,
+    /// The latest `(requested_epoch_number, request_time)`
+    pub latest_epoch_requested: Mutex<(u64, Instant)>,
+    #[ignore_malloc_size_of = "only stores reference to others"]
     pub phase_manager: SynchronizationPhaseManager,
     pub phase_manager_lock: Mutex<u32>,
 
     // Worker task queue for recover public
+    #[ignore_malloc_size_of = "channels are not handled in MallocSizeOf"]
     pub recover_public_queue: Arc<AsyncTaskQueue<RecoverPublicTask>>,
 
     // Worker task queue for local message
+    #[ignore_malloc_size_of = "channels are not handled in MallocSizeOf"]
     local_message: AsyncTaskQueue<LocalMessageTask>,
 
     // state sync for any checkpoint
+    #[ignore_malloc_size_of = "not used on archive nodes"]
     pub state_sync: Arc<SnapshotChunkSync>,
 
     /// The epoch id of the remotely synchronized state.
@@ -340,7 +375,7 @@ pub struct SynchronizationProtocolHandler {
     light_provider: Arc<LightProvider>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, DeriveMallocSizeOf)]
 pub struct ProtocolConfiguration {
     pub is_consortium: bool,
     pub send_tx_period: Duration,
@@ -364,7 +399,6 @@ pub struct ProtocolConfiguration {
     pub max_trans_count_received_in_catch_up: u64,
     pub min_peers_tx_propagation: usize,
     pub max_peers_tx_propagation: usize,
-    pub future_block_buffer_capacity: usize,
     pub max_downloading_chunks: usize,
     pub test_mode: bool,
     pub dev_mode: bool,
@@ -374,6 +408,7 @@ pub struct ProtocolConfiguration {
     pub max_allowed_timeout_in_observing_period: u64,
     pub demote_peer_for_timeout: bool,
     pub max_unprocessed_block_size: usize,
+    pub max_chunk_number_in_manifest: usize,
 }
 
 impl SynchronizationProtocolHandler {
@@ -400,9 +435,6 @@ impl SynchronizationProtocolHandler {
             recover_public_queue.clone(),
         ));
 
-        let future_block_buffer_capacity =
-            protocol_config.future_block_buffer_capacity;
-
         let state_sync = Arc::new(SnapshotChunkSync::new(state_sync_config));
 
         Self {
@@ -411,10 +443,7 @@ impl SynchronizationProtocolHandler {
             graph: sync_graph.clone(),
             syn: sync_state.clone(),
             request_manager,
-            latest_epoch_requested: Mutex::new(0),
-            future_blocks: FutureBlockContainer::new(
-                future_block_buffer_capacity,
-            ),
+            latest_epoch_requested: Mutex::new((0, Instant::now())),
             phase_manager: SynchronizationPhaseManager::new(
                 initial_sync_phase,
                 sync_state.clone(),
@@ -528,13 +557,10 @@ impl SynchronizationProtocolHandler {
     fn handle_error(
         &self, io: &dyn NetworkContext, peer: &NodeId, msg_id: MsgId, e: Error,
     ) {
-        warn!(
-            "Error while handling message, peer={}, msgid={:?}, error={}",
-            peer, msg_id, e
-        );
-
         let mut disconnect = true;
+        let mut warn = true;
         let reason = format!("{}", e.0);
+        let error_reason = format!("{:?}", e);
         let mut op = None;
 
         // NOTE, DO NOT USE WILDCARD IN THE FOLLOWING MATCH STATEMENT!
@@ -559,6 +585,10 @@ impl SynchronizationProtocolHandler {
                 op = Some(UpdateNodeOperation::Demotion)
             }
             ErrorKind::RequestNotFound => disconnect = false,
+            ErrorKind::InCatchUpMode(_) => {
+                disconnect = false;
+                warn = false;
+            }
             ErrorKind::TooManyTrans => {}
             ErrorKind::InvalidTimestamp => {
                 op = Some(UpdateNodeOperation::Demotion)
@@ -638,6 +668,18 @@ impl SynchronizationProtocolHandler {
                 op = Some(UpdateNodeOperation::Remove)
             }
             ErrorKind::NotSupported(_) => disconnect = false,
+        }
+
+        if warn {
+            warn!(
+                "Error while handling message, peer={}, msgid={:?}, error={}",
+                peer, msg_id, error_reason
+            );
+        } else {
+            debug!(
+                "Minor error while handling message, peer={}, msgid={:?}, error={}",
+                peer, msg_id, error_reason
+            );
         }
 
         if disconnect {
@@ -754,18 +796,36 @@ impl SynchronizationProtocolHandler {
         let median_peer_epoch =
             self.syn.median_epoch_from_normal_peers().unwrap_or(0);
         let my_best_epoch = self.graph.consensus.best_epoch_number();
+        let (mut latest_requested_epoch, latest_request_time) =
+            *latest_requested;
+
+        // If the gap is too large, it means that the next epoch of
+        // `my_best_epoch` is missing, either because received
+        // epoch_set is wrong or we have too many epochs with
+        // blocks not received.
+        if latest_requested_epoch >= my_best_epoch + EPOCH_SYNC_MAX_GAP {
+            if latest_request_time.elapsed()
+                < Duration::from_secs(EPOCH_SYNC_RESTART_TIMEOUT_S)
+            {
+                return;
+            } else {
+                // Restart from `my_best_epoch` to fix possible problems.
+                latest_requested_epoch = my_best_epoch;
+            }
+        }
 
         while self.request_manager.num_epochs_in_flight()
             < EPOCH_SYNC_MAX_INFLIGHT
-            && (*latest_requested < median_peer_epoch || median_peer_epoch == 0)
+            && latest_requested_epoch < my_best_epoch + EPOCH_SYNC_MAX_GAP
+            && (latest_requested_epoch < median_peer_epoch
+                || median_peer_epoch == 0)
         {
-            let from = cmp::max(my_best_epoch, *latest_requested) + 1;
+            let from = cmp::max(my_best_epoch, latest_requested_epoch) + 1;
             // Check epochs from db
             if let Some(epoch_hashes) =
                 self.graph.data_man.all_epoch_set_hashes_from_db(from)
             {
                 debug!("Recovered epoch {} from db", from);
-                // FIXME better handle this in our event loop separately
                 if self.need_requesting_blocks() {
                     self.request_blocks(io, None, epoch_hashes);
                 } else {
@@ -776,12 +836,12 @@ impl SynchronizationProtocolHandler {
                         true, /* ignore_db */
                     );
                 }
-                *latest_requested = from;
+                latest_requested_epoch = from;
                 continue;
             } else if median_peer_epoch == 0 {
                 // We have recovered all epochs from db, and there is no peer to
                 // request new epochs, so we should enter `Latest` phase
-                return;
+                break;
             }
 
             // Epoch hashes are not in db, so should be requested from another
@@ -798,13 +858,16 @@ impl SynchronizationProtocolHandler {
             let until = {
                 let max_to_send = EPOCH_SYNC_MAX_INFLIGHT
                     - self.request_manager.num_epochs_in_flight();
+                let maybe_peer_info = self.syn.get_peer_info(&peer.unwrap());
+                if maybe_peer_info.is_err() {
+                    // The peer is disconnected after we chose it.
+                    // `latest_requested` is not updated, so we just continue to
+                    // try another peer.
+                    continue;
+                }
 
-                let best_of_this_peer = self
-                    .syn
-                    .get_peer_info(&peer.unwrap())
-                    .unwrap()
-                    .read()
-                    .best_epoch;
+                let best_of_this_peer =
+                    maybe_peer_info.unwrap().read().best_epoch;
 
                 let until = from + cmp::min(EPOCH_SYNC_BATCH_SIZE, max_to_send);
                 cmp::min(until, best_of_this_peer + 1)
@@ -822,8 +885,9 @@ impl SynchronizationProtocolHandler {
 
             self.request_manager
                 .request_epoch_hashes(io, peer, epochs, None);
-            *latest_requested = until - 1;
+            latest_requested_epoch = until - 1;
         }
+        *latest_requested = (latest_requested_epoch, Instant::now());
     }
 
     pub fn request_block_headers(
@@ -914,6 +978,7 @@ impl SynchronizationProtocolHandler {
                 // A block might be loaded from db and sent to the local queue
                 // multiple times, but we should only process it and request its
                 // dependence once.
+                received_blocks.insert(hash);
                 continue;
             }
             if !task.requested.contains(&hash) {
@@ -939,10 +1004,11 @@ impl SynchronizationProtocolHandler {
                         false, // insert_into_consensus
                         true,  // persistent
                     );
-                    if !insert_result.is_new_valid() {
-                        // If header is invalid or already processed, we do not
-                        // need to request the block, so
-                        // just mark it received
+                    if !insert_result.should_process_body() {
+                        // If the header is invalid or the block has been
+                        // processed in consensus, we do not need to request the
+                        // block, so just mark it
+                        // received.
                         received_blocks.insert(hash);
                         continue;
                     }
@@ -1281,7 +1347,7 @@ impl SynchronizationProtocolHandler {
                 );
             }
         }
-        let mut sent_transactions = short_ids_transactions;
+        let mut sent_transactions = short_ids_transactions.clone();
         if !tx_hashes_transactions.is_empty() {
             TX_HASHES_PROPAGATE_METER.mark(tx_hashes_transactions.len());
             for tx in &tx_hashes_transactions {
@@ -1290,7 +1356,7 @@ impl SynchronizationProtocolHandler {
                     tx.hash(),
                 );
             }
-            sent_transactions.extend(tx_hashes_transactions);
+            sent_transactions.extend(tx_hashes_transactions.clone());
         }
 
         TX_PROPAGATE_METER.mark(sent_transactions.len());
@@ -1309,6 +1375,7 @@ impl SynchronizationProtocolHandler {
             .request_manager
             .append_sent_transactions(sent_transactions);
 
+        let mut resend_flag = false;
         for i in 0..lucky_peers.len() {
             let peer_id = lucky_peers[i];
             let (key1, key2) = nonces.pop().unwrap();
@@ -1332,8 +1399,21 @@ impl SynchronizationProtocolHandler {
                         "failed to propagate transaction ids to peer, id: {}, err: {}",
                         peer_id, e
                     );
+                    resend_flag = true;
                 }
             }
+        }
+
+        if resend_flag {
+            let mut resend_transactions: HashMap<H256, Arc<SignedTransaction>> =
+                HashMap::new();
+            for tx in short_ids_transactions {
+                resend_transactions.insert(tx.hash, tx.clone());
+            }
+            for tx in tx_hashes_transactions {
+                resend_transactions.insert(tx.hash, tx.clone());
+            }
+            self.set_to_propagate_trans(resend_transactions);
         }
     }
 
@@ -1343,15 +1423,15 @@ impl SynchronizationProtocolHandler {
             .unwrap()
             .as_secs();
 
-        let mut missed_body_block_hashes = HashSet::new();
+        let mut missed_body_block_hashes = HashMap::new();
         let mut need_to_relay = HashSet::new();
-        let headers = self.future_blocks.get_before(now_timestamp);
+        let headers = self.graph.future_blocks.get_before(now_timestamp);
 
         if headers.is_empty() {
             return;
         }
 
-        for mut header in headers {
+        for (mut header, peer) in headers {
             let hash = header.hash();
             let (insert_result, to_relay) = self.graph.insert_block_header(
                 &mut header,
@@ -1365,22 +1445,21 @@ impl SynchronizationProtocolHandler {
 
                 // check block body
                 if !self.graph.contains_block(&hash) {
-                    missed_body_block_hashes.insert(hash);
+                    // There are no duplicate headers in `future_blocks`, so
+                    // using Vec for each peer is enough.
+                    missed_body_block_hashes
+                        .entry(peer)
+                        .or_insert(Vec::new())
+                        .push(hash);
                 }
             }
         }
 
-        let chosen_peer = PeerFilter::new(msgid::GET_CMPCT_BLOCKS)
-            .throttle(msgid::GET_BLOCKS)
-            .select(&self.syn);
-
-        // request missing blocks
-        self.request_missing_blocks(
-            io,
-            chosen_peer,
-            missed_body_block_hashes.into_iter().collect(),
-        )
-        .ok();
+        for (peer, missing_hashes) in missed_body_block_hashes {
+            // request missing blocks from the peer where we receive their
+            // headers.
+            self.request_missing_blocks(io, Some(peer), missing_hashes);
+        }
 
         // relay if necessary
         self.relay_blocks(io, need_to_relay.into_iter().collect())
@@ -1411,8 +1490,30 @@ impl SynchronizationProtocolHandler {
 
     pub fn remove_expired_flying_request(&self, io: &dyn NetworkContext) {
         self.request_manager.resend_timeout_requests(io);
-        self.request_manager
+        let cancelled_requests = self
+            .request_manager
             .resend_waiting_requests(io, !self.catch_up_mode());
+        self.handle_cancelled_requests(cancelled_requests);
+    }
+
+    /// Remove the blocks in `cancelled_requests` and their future set from sync
+    /// graph, so if they are needed in the future, they will be requested
+    /// again.
+    fn handle_cancelled_requests(
+        &self, cancelled_requests: Vec<Box<dyn Request>>,
+    ) {
+        let mut to_remove_blocks = HashSet::new();
+        for request in cancelled_requests {
+            // We do not need to handle `GetBlockHeaders` because if a header is
+            // not received, the block will not exist in our sync
+            // graph.
+            if let Some(block_hashes) = try_get_block_hashes(&request) {
+                for hash in block_hashes {
+                    to_remove_blocks.insert(*hash);
+                }
+            }
+        }
+        self.graph.remove_blocks_and_future(&to_remove_blocks);
     }
 
     pub fn send_heartbeat(&self, io: &dyn NetworkContext) {
@@ -1468,7 +1569,7 @@ impl SynchronizationProtocolHandler {
     pub fn request_missing_blocks(
         &self, io: &dyn NetworkContext, peer_id: Option<NodeId>,
         hashes: Vec<H256>,
-    ) -> Result<(), Error>
+    )
     {
         let catch_up_mode = self.catch_up_mode();
         if catch_up_mode {
@@ -1477,7 +1578,6 @@ impl SynchronizationProtocolHandler {
             self.request_manager
                 .request_compact_blocks(io, peer_id, hashes, None);
         }
-        Ok(())
     }
 
     pub fn request_blocks(
@@ -1554,7 +1654,7 @@ impl SynchronizationProtocolHandler {
         if let Some(block) = self
             .graph
             .data_man
-            .block_by_hash(hash, false /* update_cache */)
+            .block_by_hash(hash, true /* update_cache */)
         {
             debug!("Recovered block {:?} from db", hash);
             // Process blocks from db

@@ -9,11 +9,11 @@ use crate::{
         Error, SynchronizationState,
     },
 };
+use malloc_size_of_derive::MallocSizeOf as DeriveMallocSizeOf;
 use network::{node_table::NodeId, NetworkContext};
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
-use rlp_derive::{RlpDecodableWrapper, RlpEncodableWrapper};
 
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, DeriveMallocSizeOf)]
 pub enum DynamicCapability {
     NormalPhase(bool),  // provide tx relay
     ServeHeaders(bool), // provide block header downloads
@@ -72,7 +72,7 @@ impl Decodable for DynamicCapability {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, DeriveMallocSizeOf)]
 pub struct DynamicCapabilitySet {
     caps: [Option<DynamicCapability>; 3],
 }
@@ -90,9 +90,22 @@ impl DynamicCapabilitySet {
     }
 }
 
-#[derive(Debug, RlpDecodableWrapper, RlpEncodableWrapper)]
+#[derive(Debug)]
 pub struct DynamicCapabilityChange {
     pub changed: DynamicCapability,
+}
+
+impl Encodable for DynamicCapabilityChange {
+    fn rlp_append(&self, s: &mut RlpStream) {
+        s.append_internal(&self.changed);
+    }
+}
+
+impl Decodable for DynamicCapabilityChange {
+    fn decode(d: &Rlp) -> Result<Self, DecoderError> {
+        let changed = d.as_val()?;
+        Ok(DynamicCapabilityChange { changed })
+    }
 }
 
 impl Handleable for DynamicCapabilityChange {

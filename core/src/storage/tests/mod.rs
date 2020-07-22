@@ -6,6 +6,8 @@ mod snapshot;
 pub use snapshot::FakeSnapshotMptDb;
 
 #[cfg(test)]
+mod proofs;
+#[cfg(test)]
 mod sharded_iter_merger;
 #[cfg(test)]
 mod state;
@@ -59,7 +61,9 @@ pub struct FakeStateManager {
 
 #[cfg(test)]
 impl FakeStateManager {
-    fn new(conflux_data_dir: String) -> Result<Self> {
+    fn new(
+        conflux_data_dir: String, snapshot_epoch_count: u32,
+    ) -> Result<Self> {
         fs::create_dir_all(conflux_data_dir.as_str())?;
         let mut unit_test_data_dir = "".to_string();
         for i in 0..100 {
@@ -79,8 +83,9 @@ impl FakeStateManager {
             Ok(FakeStateManager {
                 data_dir: unit_test_data_dir.clone(),
                 state_manager: Some(StateManager::new(StorageConfiguration {
+                    additional_maintained_snapshot_count: 0,
                     consensus_param: ConsensusParam {
-                        snapshot_epoch_count: 10_000_000,
+                        snapshot_epoch_count,
                     },
                     debug_snapshot_checker_threads: 0,
                     delta_mpts_cache_recent_lfu_factor: 4.0,
@@ -130,7 +135,9 @@ impl DerefMut for FakeStateManager {
 }
 
 #[cfg(test)]
-pub fn new_state_manager_for_unit_test() -> FakeStateManager {
+pub fn new_state_manager_for_unit_test_with_snapshot_epoch_count(
+    snapshot_epoch_count: u32,
+) -> FakeStateManager {
     const WITH_LOGGER: bool = false;
     if WITH_LOGGER {
         log4rs::init_config(
@@ -154,16 +161,33 @@ pub fn new_state_manager_for_unit_test() -> FakeStateManager {
         .ok();
     }
 
-    FakeStateManager::new("./conflux_unit_test_data_dir/".to_string()).unwrap()
+    FakeStateManager::new(
+        "./conflux_unit_test_data_dir/".to_string(),
+        snapshot_epoch_count,
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+pub fn new_state_manager_for_unit_test() -> FakeStateManager {
+    let snapshot_epoch_count = 10_000_000;
+    new_state_manager_for_unit_test_with_snapshot_epoch_count(
+        snapshot_epoch_count,
+    )
 }
 
 #[derive(Default)]
-pub struct DumpedDeltaMptIterator {
-    pub kv: Vec<(Vec<u8>, Box<[u8]>)>,
+pub struct DumpedMptKvIterator {
+    pub kv: Vec<MptKeyValue>,
 }
 
-impl DumpedDeltaMptIterator {
-    pub fn iterate<'a, DeltaMptDumper: KVInserter<(Vec<u8>, Box<[u8]>)>>(
+pub struct DumpedMptKvFallibleIterator {
+    pub kv: Vec<MptKeyValue>,
+    pub index: usize,
+}
+
+impl DumpedMptKvIterator {
+    pub fn iterate<'a, DeltaMptDumper: KVInserter<MptKeyValue>>(
         &self, dumper: &mut DeltaMptDumper,
     ) -> Result<()> {
         let mut sorted_kv = self.kv.clone();
@@ -175,14 +199,25 @@ impl DumpedDeltaMptIterator {
     }
 }
 
-impl KVInserter<(Vec<u8>, Box<[u8]>)> for DumpedDeltaMptIterator {
-    fn push(&mut self, v: (Vec<u8>, Box<[u8]>)) -> Result<()> {
+impl KVInserter<MptKeyValue> for DumpedMptKvIterator {
+    fn push(&mut self, v: MptKeyValue) -> Result<()> {
         let (mpt_key, value) = v;
         let snapshot_key =
             StorageKey::from_delta_mpt_key(&mpt_key).to_key_bytes();
 
         self.kv.push((snapshot_key, value));
         Ok(())
+    }
+}
+
+impl FallibleIterator for DumpedMptKvFallibleIterator {
+    type Error = Error;
+    type Item = MptKeyValue;
+
+    fn next(&mut self) -> Result<Option<Self::Item>> {
+        let result = Ok(self.kv.get(self.index).cloned());
+        self.index += 1;
+        result
     }
 }
 
@@ -214,6 +249,14 @@ fn generate_keys(number_of_keys: usize) -> Vec<Vec<u8>> {
 }
 
 #[cfg(test)]
+fn generate_account_keys(number_of_keys: usize) -> Vec<Vec<u8>> {
+    let mut rng = get_rng_for_test();
+    (0..number_of_keys)
+        .map(|_| rng.gen::<[u8; 20]>().to_vec())
+        .collect()
+}
+
+#[cfg(test)]
 fn get_rng_for_test() -> ChaChaRng { ChaChaRng::from_seed([123; 32]) }
 
 // Kept for debugging.
@@ -236,9 +279,13 @@ use crate::storage::{
     StorageConfiguration,
 };
 use crate::storage::{
-    impls::{errors::*, merkle_patricia_trie::CompressedPathRaw},
+    impls::{
+        errors::*,
+        merkle_patricia_trie::{CompressedPathRaw, MptKeyValue},
+    },
     KVInserter,
 };
+use fallible_iterator::FallibleIterator;
 use kvdb::{DBTransaction, DBValue, KeyValueDB};
 use parity_util_mem::{MallocSizeOf, MallocSizeOfOps};
 use primitives::StorageKey;

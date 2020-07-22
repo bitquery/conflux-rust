@@ -32,7 +32,7 @@ pub trait StateTrait {
     // pairs.
     fn delete_all(
         &mut self, access_key_prefix: StorageKey,
-    ) -> Result<Option<Vec<(Vec<u8>, Box<[u8]>)>>>;
+    ) -> Result<Option<Vec<MptKeyValue>>>;
 
     // Finalize
     /// It's costly to compute state root however it's only necessary to compute
@@ -46,12 +46,14 @@ pub trait StateTrait {
     /// Node merkle is computed on the value and children hashes, ignoring the
     /// compressed path.
     fn get_node_merkle_all_versions(
-        &self, access_key: StorageKey,
-    ) -> Result<(Option<MerkleHash>, Option<MerkleHash>, Option<MerkleHash>)>;
+        &self, access_key: StorageKey, with_proof: bool,
+    ) -> Result<(NodeMerkleTriplet, NodeMerkleProof)>;
 }
 
 use super::{
-    impls::{errors::*, state_proof::StateProof},
-    StateRootWithAuxInfo,
+    impls::{
+        errors::*, node_merkle_proof::NodeMerkleProof, state_proof::StateProof,
+    },
+    MptKeyValue, StateRootWithAuxInfo,
 };
-use primitives::{EpochId, MerkleHash, StorageKey};
+use primitives::{EpochId, NodeMerkleTriplet, StorageKey};

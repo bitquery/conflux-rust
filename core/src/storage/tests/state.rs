@@ -91,7 +91,7 @@ fn test_get_set_at_second_commit() {
         ))
         .unwrap()
         .unwrap();
-    println!("Set new {} keys for state_1.", keys_1_new.len(),);
+    println!("Set new {} keys for state_1.", keys_1_new.len());
     for key in keys_1_new {
         let value = vec![&key[..], &key[..]].concat();
         state_1
@@ -179,11 +179,12 @@ fn test_snapshot_random_read_performance() {
             &[&**key; 4].concat()[0..StorageKey::ACCOUNT_BYTES],
         );
         address.set_user_account_type_bits();
-        let account = primitives::Account::new_empty_with_balance(
+        let account = Account::new_empty_with_balance(
             &address,
             &DEFAULT_BALANCE.into(),
             &0.into(),
-        );
+        )
+        .unwrap();
         let account_key = StorageKey::new_account_key(&address);
         state_0
             .set(account_key, rlp::encode(&account).into())
@@ -259,6 +260,16 @@ fn simulate_transactions(
     {
         thread::sleep(Duration::from_secs(1));
     }
+
+    let mut addresses = Vec::with_capacity(keys.len());
+    for key in keys {
+        let mut address = Address::from_slice(
+            &[&**key; 4].concat()[0..StorageKey::ACCOUNT_BYTES],
+        );
+        address.set_user_account_type_bits();
+        addresses.push(address);
+    }
+
     let mut epoch_id = H256::default();
     epoch_id.as_bytes_mut()[0] = epoch;
     let mut state = state_manager
@@ -285,9 +296,9 @@ fn simulate_transactions(
         for thread in 0..THREADS {
             let range_start = len * thread / THREADS;
             let range_end = len * (thread + 1) / THREADS;
-            let key_range = unsafe {
-                std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(
-                    &keys[range_start..range_end],
+            let addresses_range = unsafe {
+                std::mem::transmute::<&[Address], &'static [Address]>(
+                    &addresses[range_start..range_end],
                 )
             };
             let value_range = unsafe {
@@ -301,16 +312,10 @@ fn simulate_transactions(
             };
             join_handles.push(thread::spawn(move || {
                 let mut i = 0;
-                for key in key_range {
-                    let mut address = Address::from_slice(
-                        &[&**key; 4].concat()[0..StorageKey::ACCOUNT_BYTES],
-                    );
-                    address.set_user_account_type_bits();
-                    let account_key = StorageKey::new_account_key(&address);
-
+                for address in addresses_range {
                     value_range[i] = Some(
                         state_r
-                            .get(account_key)
+                            .get(StorageKey::new_account_key(&address))
                             .expect("Failed to get key.")
                             .expect("no such key"),
                     );
@@ -324,16 +329,10 @@ fn simulate_transactions(
         }
     } else {
         let mut i = 0;
-        for key in keys {
-            let mut address = Address::from_slice(
-                &[&**key; 4].concat()[0..StorageKey::ACCOUNT_BYTES],
-            );
-            address.set_user_account_type_bits();
-            let account_key = StorageKey::new_account_key(&address);
-
+        for address in &addresses {
             values[i] = Some(
                 state
-                    .get(account_key)
+                    .get(StorageKey::new_account_key(&address))
                     .expect("Failed to get key.")
                     .expect("no such key"),
             );
@@ -346,9 +345,11 @@ fn simulate_transactions(
     // Update accounts.
     let now = Instant::now();
     for i in 0..len {
-        let mut account: primitives::Account =
-            rlp::decode(values[i].as_ref().unwrap())
-                .expect("failed to decode rlp");
+        let mut account: primitives::Account = Account::new_from_rlp(
+            addresses[i],
+            &Rlp::new(&values[i].as_ref().unwrap()),
+        )
+        .expect("failed to decode rlp");
         if i % 2 == 0 {
             account.balance -= U256::one();
         } else {
@@ -689,88 +690,6 @@ fn test_set_order_concurrent() {
     }
 }
 
-// FIXME: Redesign the test for proof.
-#[test]
-fn test_proofs() {
-    let mut rng = get_rng_for_test();
-    let state_manager = new_state_manager_for_unit_test();
-    let mut state = state_manager.get_state_for_genesis_write();
-    let mut keys: Vec<Vec<u8>> = generate_keys(TEST_NUMBER_OF_KEYS)
-        .iter()
-        .filter(|_| rng.gen_bool(0.5))
-        .cloned()
-        .collect();
-
-    for key in &keys {
-        state
-            .set(StorageKey::AccountKey(key), key[..].into())
-            .expect("Failed to insert key.");
-    }
-
-    let mut epoch_id = H256::default();
-    epoch_id.as_bytes_mut()[0] = 1;
-    let root = state.compute_state_root().unwrap().state_root;
-    state.commit(epoch_id).unwrap();
-
-    keys.shuffle(&mut rng);
-
-    for key in &keys {
-        let (value, proof) = state
-            .get_with_proof(StorageKey::AccountKey(key))
-            .expect("Failed to get key.");
-
-        let key = &key.to_vec();
-        let value = value.as_ref().map(|b| &**b);
-
-        // valid proof
-        assert!(proof.is_valid_kv(key, value, root.clone()));
-
-        // invalid state root
-        let mut invalid_root = root.delta_root.clone();
-        invalid_root.as_bytes_mut()[0] = 0x00;
-
-        assert!(!proof.is_valid_kv(
-            key,
-            value,
-            StateRoot {
-                snapshot_root: invalid_root,
-                intermediate_delta_root: invalid_root,
-                delta_root: invalid_root
-            },
-        ));
-
-        // invalid value
-        assert!(!proof.is_valid_kv(key, Some(&[0x00; 100][..]), root.clone()));
-
-        // invalid non-existence.
-        assert!(!proof.is_valid_kv(key, None, root.clone()));
-
-        // test rlp
-        assert_eq!(proof, rlp::decode(&rlp::encode(&proof)).unwrap());
-    }
-
-    let nonexistent_keys: Vec<Vec<u8>> = generate_keys(TEST_NUMBER_OF_KEYS)
-        .iter()
-        .filter(|_| rng.gen_bool(0.5))
-        .cloned()
-        .collect();
-
-    for key in &nonexistent_keys {
-        if keys.contains(key) {
-            continue;
-        }
-
-        let (value, proof) = state
-            .get_with_proof(StorageKey::AccountKey(key))
-            .expect("Failed to get key.");
-
-        assert_eq!(value, None);
-
-        // valid non-existence proof
-        assert!(proof.is_valid_kv(&key.to_vec(), None, root.clone()));
-    }
-}
-
 use super::{
     super::{state::*, state_manager::*},
     generate_keys, get_rng_for_test, new_state_manager_for_unit_test,
@@ -780,12 +699,13 @@ use crate::storage::{
     StateRootWithAuxInfo,
 };
 use cfx_types::{address_util::AddressUtil, Address, H256, U256};
-use primitives::{StateRoot, StorageKey};
+use primitives::{Account, StorageKey};
 use rand::{
     distributions::{Distribution, Uniform},
     seq::SliceRandom,
     Rng,
 };
+use rlp::Rlp;
 use std::{
     sync::Arc,
     thread,

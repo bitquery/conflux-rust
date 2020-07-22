@@ -1656,6 +1656,7 @@ impl TxReplayer {
                     "commit_log",
                     true,
                 )?),
+                false, /* unsafe_mode */
             )?
             .1,
             commit_log_vec: Default::default(),
@@ -1754,6 +1755,7 @@ impl TxReplayer {
                                 unsafe { std::mem::transmute(&sender) },
                             ),
                             &account,
+                            None,
                         )
                         .unwrap();
                 }
@@ -1797,7 +1799,7 @@ impl TxReplayer {
                         // version
                         unsafe { std::mem::transmute(&tx.amount_wei) }, /* balance */
                         &0.into(), /* nonce */
-                    );
+                    )?;
                 }
             }
             latest_state
@@ -1809,6 +1811,7 @@ impl TxReplayer {
                         unsafe { std::mem::transmute(&receiver) },
                     ),
                     &account,
+                    None,
                 )
                 .unwrap();
             self.ops_counts.set(self.ops_counts.get() + 2);

@@ -7,6 +7,7 @@ pub mod prefetcher;
 use self::account_entry::{AccountEntry, AccountState};
 use crate::{
     bytes::Bytes,
+    consensus::debug::ComputeEpochDebugRecord,
     executive::SPONSOR_WHITELIST_CONTROL_CONTRACT_ADDRESS,
     hash::KECCAK_EMPTY,
     parameters::staking::*,
@@ -30,7 +31,10 @@ mod state_tests;
 mod account_entry;
 mod substate;
 
-pub use self::{account_entry::OverlayAccount, substate::Substate};
+pub use self::{
+    account_entry::OverlayAccount,
+    substate::{CallStackInfo, Substate},
+};
 use crate::evm::Spec;
 use parking_lot::{MappedRwLockWriteGuard, RwLock, RwLockWriteGuard};
 
@@ -70,6 +74,7 @@ struct StakingState {
     // This is the total number of CFX used as staking.
     total_staking_tokens: U256,
     // This is the total number of CFX used as collateral.
+    // This field should never be read during tx execution. (Can be updated)
     total_storage_tokens: U256,
     // This is the interest rate per block.
     interest_rate_per_block: U256,
@@ -80,6 +85,7 @@ struct StakingState {
 pub struct State {
     db: StateDb,
 
+    dirty_accounts_to_commit: Vec<(Address, AccountEntry)>,
     cache: RwLock<HashMap<Address, AccountEntry>>,
     staking_state_checkpoints: RwLock<Vec<StakingState>>,
     checkpoints: RwLock<Vec<HashMap<Address, Option<AccountEntry>>>>,
@@ -134,6 +140,7 @@ impl State {
             },
             block_number,
             vm,
+            dirty_accounts_to_commit: Default::default(),
         }
     }
 
@@ -186,7 +193,8 @@ impl State {
         index
     }
 
-    pub fn checkout_collateral_for_storage(
+    /// Charges or refund storage collateral and update `total_storage_tokens`.
+    pub fn settle_collateral_for_storage(
         &mut self, addr: &Address,
     ) -> DbResult<CollateralCheckResult> {
         let (inc, sub) =
@@ -207,7 +215,7 @@ impl State {
         }
         if inc > 0 {
             let delta = U256::from(inc) * *COLLATERAL_PER_STORAGE_KEY;
-            if self.is_contract(addr) {
+            if addr.is_contract_address() {
                 let sponsor_balance =
                     self.sponsor_balance_for_collateral(addr)?;
                 // sponsor_balance is not enough to cover storage incremental.
@@ -218,7 +226,7 @@ impl State {
                     });
                 }
             } else {
-                let balance = self.balance(addr).expect("no db error");
+                let balance = self.balance(addr)?;
                 // balance is not enough to cover storage incremental.
                 if delta > balance {
                     return Ok(CollateralCheckResult::NotEnoughBalance {
@@ -232,8 +240,11 @@ impl State {
         Ok(CollateralCheckResult::Valid)
     }
 
-    // This function only returns valid or db error
-    pub fn checkout_ownership_changed(
+    /// Collects the cache (`ownership_change` in `OverlayAccount`) of storage
+    /// change and write to substate and
+    /// `storage_released`/`storage_collateralized` in overlay account.
+    // It is idempotent. But its execution is cost.
+    pub fn collect_ownership_changed(
         &mut self, substate: &mut Substate,
     ) -> DbResult<CollateralCheckResult> {
         let mut collateral_for_storage_sub = HashMap::new();
@@ -265,6 +276,9 @@ impl State {
                 }
             }
         }
+        // TODO: the overlay account and substate seem store the same content,
+        // to be remove one of them. But the current impl of suicide breaks
+        // this consistency, it may be changed later.
         for (addr, sub) in &collateral_for_storage_sub {
             self.require_exists(&addr, false)?
                 .add_unrefunded_storage_entries(*sub);
@@ -280,12 +294,12 @@ impl State {
         Ok(CollateralCheckResult::Valid)
     }
 
-    pub fn check_collateral_for_storage_finally(
-        &mut self, storage_owner: &Address, storage_limit: &U256,
+    pub fn collect_ownership_changed_and_settle(
+        &mut self, original_sender: &Address, storage_limit: &U256,
         substate: &mut Substate,
     ) -> DbResult<CollateralCheckResult>
     {
-        self.checkout_ownership_changed(substate)?;
+        self.collect_ownership_changed(substate)?;
 
         let touched_addresses =
             if let Some(checkpoint) = self.checkpoints.get_mut().last() {
@@ -295,14 +309,14 @@ impl State {
             };
         // No new addresses added to checkpoint in this for-loop.
         for address in touched_addresses.iter() {
-            match self.checkout_collateral_for_storage(address)? {
+            match self.settle_collateral_for_storage(address)? {
                 CollateralCheckResult::Valid => {}
                 res => return Ok(res),
             }
         }
 
         let collateral_for_storage =
-            self.collateral_for_storage(storage_owner)?;
+            self.collateral_for_storage(original_sender)?;
         if collateral_for_storage > *storage_limit {
             Ok(CollateralCheckResult::ExceedStorageLimit {
                 limit: *storage_limit,
@@ -405,10 +419,12 @@ impl State {
         })
     }
 
-    // TODO: first check the type bits of the address.
-    pub fn is_contract(&self, address: &Address) -> bool {
+    pub fn is_contract_with_code(&self, address: &Address) -> bool {
+        if !address.is_contract_address() {
+            return false;
+        }
         self.ensure_cached(address, RequireCache::None, |acc| {
-            acc.map_or(false, |acc| acc.is_contract())
+            acc.map_or(false, |acc| acc.code_hash() != KECCAK_EMPTY)
         })
         .unwrap_or(false)
     }
@@ -683,14 +699,14 @@ impl State {
     }
 
     pub fn inc_nonce(&mut self, address: &Address) -> DbResult<()> {
-        self.require_or_new_user_account(address)
+        self.require_or_new_basic_account(address)
             .map(|mut x| x.inc_nonce())
     }
 
     pub fn set_nonce(
         &mut self, address: &Address, nonce: &U256,
     ) -> DbResult<()> {
-        self.require_or_new_user_account(address)
+        self.require_or_new_basic_account(address)
             .map(|mut x| x.set_nonce(nonce))
     }
 
@@ -713,16 +729,17 @@ impl State {
         &mut self, address: &Address, by: &U256, cleanup_mode: CleanupMode,
     ) -> DbResult<()> {
         let exists = self.exists(address)?;
-        if !exists && !address.is_user_account_address() {
-            // Sending to non-existent non user account address is
-            // not allowed.
+        if !address.is_valid_address() {
+            // Sending to invalid addresses are not allowed. Note that this
+            // check is required because at serialization we assume
+            // only valid addresses.
             //
             // There are checks to forbid it at transact level.
             //
             // The logic here is intended for incorrect miner coin-base. In this
             // case, the mining reward get lost.
             warn!(
-                "add_balance: address does not already exist and is not an user account. {:?}",
+                "add_balance: address does not already exist and is not a valid address. {:?}",
                 address
             );
             return Ok(());
@@ -730,7 +747,7 @@ impl State {
         if !by.is_zero()
             || (cleanup_mode == CleanupMode::ForceCreate && !exists)
         {
-            self.require_or_new_user_account(address)?.add_balance(by);
+            self.require_or_new_basic_account(address)?.add_balance(by);
         }
 
         if let CleanupMode::TrackTouched(set) = cleanup_mode {
@@ -909,21 +926,29 @@ impl State {
         }
     }
 
-    fn commit_staking_state(&mut self) -> DbResult<()> {
+    fn commit_staking_state(
+        &mut self, mut debug_record: Option<&mut ComputeEpochDebugRecord>,
+    ) -> DbResult<()> {
         self.db.set_annual_interest_rate(
             &(self.staking_state.interest_rate_per_block
                 * U256::from(BLOCKS_PER_YEAR)),
+            debug_record.as_deref_mut(),
         )?;
         self.db.set_accumulate_interest_rate(
             &self.staking_state.accumulate_interest_rate,
+            debug_record.as_deref_mut(),
         )?;
-        self.db
-            .set_total_issued_tokens(&self.staking_state.total_issued_tokens)?;
+        self.db.set_total_issued_tokens(
+            &self.staking_state.total_issued_tokens,
+            debug_record.as_deref_mut(),
+        )?;
         self.db.set_total_staking_tokens(
             &self.staking_state.total_staking_tokens,
+            debug_record.as_deref_mut(),
         )?;
         self.db.set_total_storage_tokens(
             &self.staking_state.total_storage_tokens,
+            debug_record,
         )?;
         Ok(())
     }
@@ -932,14 +957,22 @@ impl State {
     /// killed.
     fn recycle_storage(
         &mut self, killed_addresses: Vec<Address>,
-    ) -> DbResult<()> {
+        mut debug_record: Option<&mut ComputeEpochDebugRecord>,
+    ) -> DbResult<()>
+    {
         for address in killed_addresses {
-            self.db.delete(StorageKey::new_account_key(&address))?;
-            let storages_opt = self
-                .db
-                .delete_all(StorageKey::new_storage_root_key(&address))?;
-            self.db
-                .delete_all(StorageKey::new_code_root_key(&address))?;
+            self.db.delete(
+                StorageKey::new_account_key(&address),
+                debug_record.as_deref_mut(),
+            )?;
+            let storages_opt = self.db.delete_all(
+                StorageKey::new_storage_root_key(&address),
+                debug_record.as_deref_mut(),
+            )?;
+            self.db.delete_all(
+                StorageKey::new_code_root_key(&address),
+                debug_record.as_deref_mut(),
+            )?;
             if let Some(storage_key_value) = storages_opt {
                 for (key, value) in storage_key_value {
                     if let StorageKey::StorageKey { .. } =
@@ -947,11 +980,11 @@ impl State {
                     {
                         let storage_value =
                             rlp::decode::<StorageValue>(value.as_ref())?;
-                        assert!(self
-                            .exists(&storage_value.owner)
-                            .expect("no db error"));
+                        let storage_owner =
+                            storage_value.owner.as_ref().unwrap_or(&address);
+                        assert!(self.exists(storage_owner)?);
                         self.sub_collateral_for_storage(
-                            &storage_value.owner,
+                            storage_owner,
                             &COLLATERAL_PER_STORAGE_KEY,
                         )?;
                     }
@@ -961,88 +994,74 @@ impl State {
         Ok(())
     }
 
+    fn precommit_make_dirty_accounts_list(&mut self) {
+        if self.dirty_accounts_to_commit.is_empty() {
+            let mut sorted_dirty_accounts = self
+                .cache
+                .get_mut()
+                .drain()
+                .filter_map(|(address, entry)| {
+                    if entry.is_dirty() {
+                        Some((address, entry))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            sorted_dirty_accounts.sort_by(|a, b| a.0.cmp(&b.0));
+            self.dirty_accounts_to_commit = sorted_dirty_accounts;
+        }
+    }
+
     pub fn commit(
         &mut self, epoch_id: EpochId,
-    ) -> DbResult<StateRootWithAuxInfo> {
+        mut debug_record: Option<&mut ComputeEpochDebugRecord>,
+    ) -> DbResult<StateRootWithAuxInfo>
+    {
         debug!("Commit epoch[{}]", epoch_id);
         assert!(self.checkpoints.get_mut().is_empty());
         assert!(self.staking_state_checkpoints.get_mut().is_empty());
 
+        self.precommit_make_dirty_accounts_list();
+        self.commit_staking_state(debug_record.as_deref_mut())?;
+
         let mut killed_addresses = Vec::new();
-        {
-            let accounts = self.cache.get_mut();
-            for (address, entry) in accounts.iter() {
-                if entry.is_dirty() && entry.account.is_none() {
-                    killed_addresses.push(*address);
+        for (address, entry) in self.dirty_accounts_to_commit.iter_mut() {
+            entry.state = AccountState::Committed;
+            match &mut entry.account {
+                None => killed_addresses.push(*address),
+                Some(account) => {
+                    account
+                        .commit(&mut self.db, debug_record.as_deref_mut())?;
+                    self.db.set::<Account>(
+                        StorageKey::new_account_key(address),
+                        &account.as_account()?,
+                        debug_record.as_deref_mut(),
+                    )?;
                 }
             }
         }
-        self.recycle_storage(killed_addresses)?;
-        self.commit_staking_state()?;
-
-        let accounts = self.cache.get_mut();
-        for (address, ref mut entry) in accounts
-            .iter_mut()
-            .filter(|&(_, ref entry)| entry.is_dirty())
-        {
-            entry.state = AccountState::Committed;
-            if let Some(ref mut account) = entry.account {
-                account.commit(&mut self.db)?;
-                self.db.set::<Account>(
-                    StorageKey::new_account_key(address),
-                    &account.as_account(),
-                )?;
-            }
-        }
+        self.recycle_storage(killed_addresses, debug_record)?;
         Ok(self.db.commit(epoch_id)?)
     }
 
     pub fn commit_and_notify(
         &mut self, epoch_id: EpochId, txpool: &SharedTransactionPool,
-    ) -> DbResult<StateRootWithAuxInfo> {
-        assert!(self.checkpoints.get_mut().is_empty());
+        debug_record: Option<&mut ComputeEpochDebugRecord>,
+    ) -> DbResult<StateRootWithAuxInfo>
+    {
+        let result = self.commit(epoch_id, debug_record)?;
+
+        debug!("Notify epoch[{}]", epoch_id);
 
         let mut accounts_for_txpool = vec![];
-
-        let mut killed_addresses = Vec::new();
-        {
-            let accounts = self.cache.get_mut();
-            for (address, entry) in accounts.iter() {
-                if entry.is_dirty() && entry.account.is_none() {
-                    killed_addresses.push(*address);
-                }
+        for (_address, entry) in &self.dirty_accounts_to_commit {
+            if let Some(account) = &entry.account {
+                accounts_for_txpool.push(account.as_account()?);
             }
         }
-        self.recycle_storage(killed_addresses)?;
-        self.commit_staking_state()?;
-
-        let accounts = self.cache.get_mut();
-        debug!("Notify epoch[{}]", epoch_id);
-        let mut sorted_dirty_addresses = accounts
-            .iter()
-            .filter_map(|(address, entry)| {
-                if entry.is_dirty() {
-                    Some(address.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        sorted_dirty_addresses.sort();
-        for address in &sorted_dirty_addresses {
-            let entry = accounts.get_mut(address).unwrap();
-            entry.state = AccountState::Committed;
-            if let Some(ref mut account) = entry.account {
-                accounts_for_txpool.push(account.as_account());
-                account.commit(&mut self.db)?;
-                self.db.set::<Account>(
-                    StorageKey::new_account_key(address),
-                    &account.as_account(),
-                )?;
-            }
-        }
-        let result = self.db.commit(epoch_id)?;
         {
+            // TODO: use channel to deliver the message.
             let txpool_clone = txpool.clone();
             std::thread::Builder::new()
                 .name("txpool_update_state".into())
@@ -1051,6 +1070,7 @@ impl State {
                 })
                 .expect("can not notify tx pool to start state");
         }
+
         Ok(result)
     }
 
@@ -1159,33 +1179,19 @@ impl State {
 
     pub fn storage_at(
         &self, address: &Address, key: &Vec<u8>,
-    ) -> DbResult<H256> {
+    ) -> DbResult<U256> {
         self.ensure_cached(address, RequireCache::None, |acc| {
-            acc.map_or(H256::zero(), |account| {
-                account.storage_at(&self.db, key).unwrap_or(H256::zero())
-            })
-        })
-    }
-
-    #[cfg(test)]
-    pub fn original_storage_at(
-        &self, address: &Address, key: &Vec<u8>,
-    ) -> DbResult<H256> {
-        self.ensure_cached(address, RequireCache::None, |acc| {
-            acc.map_or(H256::zero(), |account| {
-                account
-                    .original_storage_at(&self.db, key)
-                    .unwrap_or(H256::zero())
+            acc.map_or(U256::zero(), |account| {
+                account.storage_at(&self.db, key).unwrap_or(U256::zero())
             })
         })
     }
 
     /// Get the value of storage at a specific checkpoint.
-    /// TODO: Remove this function since it is not used outside.
     #[cfg(test)]
     pub fn checkpoint_storage_at(
         &self, start_checkpoint_index: usize, address: &Address, key: &Vec<u8>,
-    ) -> DbResult<Option<H256>> {
+    ) -> DbResult<Option<U256>> {
         #[derive(Debug)]
         enum ReturnKind {
             OriginalAt,
@@ -1210,14 +1216,14 @@ impl State {
                         if let Some(value) = account.cached_storage_at(key) {
                             return Ok(Some(value));
                         } else if account.is_newly_created_contract() {
-                            return Ok(Some(H256::zero()));
+                            return Ok(Some(U256::zero()));
                         } else {
                             kind = Some(ReturnKind::OriginalAt);
                             break;
                         }
                     }
                     Some(Some(AccountEntry { account: None, .. })) => {
-                        return Ok(Some(H256::zero()));
+                        return Ok(Some(U256::zero()));
                     }
                     Some(None) => {
                         kind = Some(ReturnKind::OriginalAt);
@@ -1236,13 +1242,18 @@ impl State {
         match kind {
             ReturnKind::SameAsNext => Ok(Some(self.storage_at(address, key)?)),
             ReturnKind::OriginalAt => {
-                Ok(Some(self.original_storage_at(address, key)?))
+                match self.db.get::<StorageValue>(
+                    StorageKey::new_storage_key(address, key.as_ref()),
+                )? {
+                    Some(storage_value) => Ok(Some(storage_value.value)),
+                    None => Ok(Some(U256::zero())),
+                }
             }
         }
     }
 
     pub fn set_storage(
-        &mut self, address: &Address, key: Vec<u8>, value: H256, owner: Address,
+        &mut self, address: &Address, key: Vec<u8>, value: U256, owner: Address,
     ) -> DbResult<()> {
         if self.storage_at(address, &key)? != value {
             self.require_exists(address, false)?
@@ -1350,11 +1361,15 @@ impl State {
         self.require_or_set(address, require_code, no_account_is_an_error)
     }
 
-    fn require_or_new_user_account(
+    fn require_or_new_basic_account(
         &self, address: &Address,
     ) -> DbResult<MappedRwLockWriteGuard<OverlayAccount>> {
         self.require_or_set(address, false, |address| {
-            if address.is_user_account_address() {
+            if address.is_valid_address() {
+                // Note that it is possible to first send money to a pre-calculated contract
+                // address and then deploy contracts. So we are going to *allow* sending to a contract
+                // address and use new_basic() to create a *stub* there. Because the contract serialization
+                // is a super-set of the normal address serialization, this should just work.
                 Ok(OverlayAccount::new_basic(
                     address,
                     U256::zero(),

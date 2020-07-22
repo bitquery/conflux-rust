@@ -2,7 +2,7 @@
 // Conflux is free software and distributed under GNU General Public License.
 // See http://www.gnu.org/licenses/
 
-use cfx_types::H256;
+use cfx_types::{H256, U64};
 use primitives::{
     BlockHashOrEpochNumber as PrimitiveBlockHashOrEpochNumber,
     EpochNumber as PrimitiveEpochNumber,
@@ -17,13 +17,17 @@ use std::{fmt, str::FromStr};
 #[derive(Debug, PartialEq, Clone, Hash, Eq)]
 pub enum EpochNumber {
     /// Number
-    Num(u64),
-    /// Latest mined block.
-    LatestMined,
+    Num(U64),
+    /// Earliest epoch (true genesis)
+    Earliest,
+    /// The latest checkpoint (cur_era_genesis)
+    LatestCheckpoint,
+    /// The latest confirmed (with the estimation of the confirmation meter)
+    LatestConfirmed,
     /// Latest block with state.
     LatestState,
-    /// Earliest epoch (genesis)
-    Earliest,
+    /// Latest mined block.
+    LatestMined,
 }
 
 //impl Default for EpochNumber {
@@ -51,8 +55,12 @@ impl Serialize for EpochNumber {
                 serializer.serialize_str("latest_state")
             }
             EpochNumber::Earliest => serializer.serialize_str("earliest"),
-            /*            EpochNumber::Pending =>
-             * serializer.serialize_str("pending"), */
+            EpochNumber::LatestCheckpoint => {
+                serializer.serialize_str("latest_checkpoint")
+            }
+            EpochNumber::LatestConfirmed => {
+                serializer.serialize_str("latest_confirmed")
+            }
         }
     }
 }
@@ -63,7 +71,13 @@ impl EpochNumber {
             EpochNumber::Earliest => PrimitiveEpochNumber::Earliest,
             EpochNumber::LatestMined => PrimitiveEpochNumber::LatestMined,
             EpochNumber::LatestState => PrimitiveEpochNumber::LatestState,
-            EpochNumber::Num(num) => PrimitiveEpochNumber::Number(num),
+            EpochNumber::Num(num) => PrimitiveEpochNumber::Number(num.as_u64()),
+            EpochNumber::LatestCheckpoint => {
+                PrimitiveEpochNumber::LatestCheckpoint
+            }
+            EpochNumber::LatestConfirmed => {
+                PrimitiveEpochNumber::LatestConfirmed
+            }
         }
     }
 }
@@ -75,8 +89,11 @@ impl FromStr for EpochNumber {
         match s {
             "latest_mined" => Ok(EpochNumber::LatestMined),
             "latest_state" => Ok(EpochNumber::LatestState),
+            "latest_confirmed" => Ok(EpochNumber::LatestConfirmed),
             "earliest" => Ok(EpochNumber::Earliest),
+            "latest_checkpoint" => Ok(EpochNumber::LatestCheckpoint),
             _ if s.starts_with("0x") => u64::from_str_radix(&s[2..], 16)
+                .map(U64::from)
                 .map(EpochNumber::Num)
                 .map_err(|e| format!("Invalid epoch number: {}", e)),
             _ => Err("Invalid epoch number: missing 0x prefix".to_string()),
@@ -89,7 +106,7 @@ impl Into<PrimitiveEpochNumber> for EpochNumber {
 }
 
 impl Into<EpochNumber> for u64 {
-    fn into(self) -> EpochNumber { EpochNumber::Num(self) }
+    fn into(self) -> EpochNumber { EpochNumber::Num(U64::from(self)) }
 }
 
 struct EpochNumberVisitor;
@@ -100,7 +117,7 @@ impl<'a> Visitor<'a> for EpochNumberVisitor {
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         write!(
             formatter,
-            "an epoch number or 'latest_mined', 'latest_state', or 'earliest'"
+            "an epoch number or 'latest_mined', 'latest_state', 'latest_checkpoint', 'latest_confirmed' or 'earliest'"
         )
     }
 
@@ -171,7 +188,8 @@ impl<'a> Visitor<'a> for BlockHashOrEpochNumberVisitor {
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         write!(
             formatter,
-            "an epoch number or 'latest_mined', 'latest_state', or 'earliest', or 'hash:<BLOCK_HASH>'"
+            "an epoch number or 'latest_mined', 'latest_state', 'latest_checkpoint',\
+             'latest_confirmed', or 'earliest', or 'hash:<BLOCK_HASH>'"
         )
     }
 

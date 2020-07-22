@@ -21,6 +21,8 @@ use crate::{
     },
 };
 use cfx_types::H256;
+use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use malloc_size_of_derive::MallocSizeOf as DeriveMallocSizeOf;
 use metrics::{
     register_meter_with_group, Gauge, GaugeUsize, Meter, MeterTimer,
 };
@@ -93,6 +95,12 @@ lazy_static! {
 #[derive(Debug)]
 struct WaitingRequest(Box<dyn Request>, Duration); // (request, delay)
 
+impl MallocSizeOf for WaitingRequest {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.0.size_of(ops) + self.1.size_of(ops)
+    }
+}
+
 /// When a header or block is requested by the `RequestManager`, it is ensured
 /// that if it's not fully received, its hash exists
 /// in `in_flight` after every function call.
@@ -102,6 +110,7 @@ struct WaitingRequest(Box<dyn Request>, Duration); // (request, delay)
 ///
 /// No lock is held when we call another function in this struct, and all locks
 /// are acquired in the same order, so there should exist no deadlocks.
+#[derive(DeriveMallocSizeOf)]
 pub struct RequestManager {
     // used to avoid send duplicated requests.
     inflight_keys: KeyContainer,
@@ -123,6 +132,8 @@ pub struct RequestManager {
     request_handler: Arc<RequestHandler>,
 
     syn: Arc<SynchronizationState>,
+
+    #[ignore_malloc_size_of = "channels are not handled in MallocSizeOf"]
     recover_public_queue: Arc<AsyncTaskQueue<RecoverPublicTask>>,
 }
 
@@ -838,16 +849,18 @@ impl RequestManager {
         }
     }
 
-    /// Send waiting requests that their backoff delay have passes
+    /// Send waiting requests that their backoff delay have passes.
+    /// Return the cancelled requests that have timeout too many times.
     pub fn resend_waiting_requests(
         &self, io: &dyn NetworkContext, remove_timeout_requests: bool,
-    ) {
+    ) -> Vec<Box<dyn Request>> {
         debug!("resend_waiting_requests: start");
         let mut waiting_requests = self.waiting_requests.lock();
         let now = Instant::now();
         let mut batcher =
             RequestBatcher::new(*DEFAULT_REQUEST_BATCH_BUCKET_SIZE);
 
+        let mut cancelled_requests = Vec::new();
         while let Some(req) = waiting_requests.pop() {
             if req.time_to_send >= now {
                 waiting_requests.push(req);
@@ -858,6 +871,7 @@ impl RequestManager {
                 // Discard stale requests
                 warn!("Request is in-flight for over an hour: {:?}", req);
                 req.request.0.on_removed(&self.inflight_keys);
+                cancelled_requests.push(req.request.0);
                 continue;
             }
 
@@ -925,6 +939,7 @@ impl RequestManager {
                 ));
             }
         }
+        cancelled_requests
     }
 
     pub fn on_peer_connected(&self, peer: &NodeId) {
@@ -984,7 +999,7 @@ impl RequestManager {
 
 /// Return block hashes in `request` if it's requesting blocks.
 /// Return None otherwise.
-fn try_get_block_hashes(request: &Box<dyn Request>) -> Option<&Vec<H256>> {
+pub fn try_get_block_hashes(request: &Box<dyn Request>) -> Option<&Vec<H256>> {
     match request.msg_id() {
         msgid::GET_BLOCKS | msgid::GET_CMPCT_BLOCKS => {
             let hashes = if let Some(req) =
@@ -1007,7 +1022,7 @@ fn try_get_block_hashes(request: &Box<dyn Request>) -> Option<&Vec<H256>> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, DeriveMallocSizeOf)]
 struct TimedWaitingRequest {
     time_to_send: Instant,
     request: WaitingRequest,

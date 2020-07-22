@@ -12,6 +12,7 @@ extern crate log;
 #[macro_use]
 extern crate serde_derive;
 extern crate cfxkey as keylib;
+extern crate tempdir;
 
 #[macro_use]
 mod config_macro;
@@ -25,6 +26,6 @@ pub mod rpc;
 #[cfg(test)]
 mod tests;
 
-/// Used in Genesis author to indicate testnet version
-/// Increase by one for every test net reset
-const TESTNET_VERSION: &str = "0000000000000000000000000000000000000020";
+/// Used in Genesis author to indicate test-net/main-net version.
+/// Increased for every test-net/main-net release with reset.
+const GENESIS_VERSION: &str = "1000000000000000000000000000000000000000";

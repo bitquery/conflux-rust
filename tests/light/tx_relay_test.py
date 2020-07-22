@@ -53,7 +53,7 @@ class TxRelayTest(ConfluxTestFramework):
         if node is None: node = self.random_full_node()
 
         blame_info = {}
-        blame_info['blame'] = 1
+        blame_info['blame'] = "0x1"
         blame_info['deferredStateRoot'] = "0x1111111111111111111111111111111111111111111111111111111111111111"
 
         return self.nodes[node].test_generateblockwithblameinfo(1, 0, blame_info)[0]
@@ -73,7 +73,7 @@ class TxRelayTest(ConfluxTestFramework):
 
             # send tx from genesis account
             tx = self.rpc[LIGHTNODE].new_tx(receiver=receiver, value=value, nonce=nonce)
-            hash = self.rpc[LIGHTNODE].send_tx(tx)
+            hash = self.rpc[LIGHTNODE].send_tx(tx, wait_for_catchup=False)
 
             self.log.info(f"sent {value: <5} to {receiver}, tx: {hash}")
             txs.append((hash, receiver, value))
@@ -82,6 +82,30 @@ class TxRelayTest(ConfluxTestFramework):
         for (hash, _, _) in txs:
             self.log.info(f"waiting for tx {hash}")
             self.rpc[FULLNODE0].wait_for_receipt(hash)
+
+        # also create some blocks with multiple transactions
+        parent_hash = self.rpc[FULLNODE0].block_by_epoch("latest_mined")['hash']
+        block_txs = []
+
+        for nonce in range(num_txs, 2 * num_txs):
+            # generate random account and value
+            receiver, _ = self.rpc[LIGHTNODE].rand_account()
+            value = random.randint(1000, 100000)
+
+            # create and store tx
+            tx = self.rpc[LIGHTNODE].new_tx(receiver=receiver, value=value, nonce=nonce)
+            block_txs.append(tx)
+            hash = tx.hash_hex()
+
+            self.log.info(f"sent {value: <5} to {receiver}, tx: {hash}")
+            txs.append((hash, receiver, value))
+
+        block_hash = self.rpc[FULLNODE0].generate_custom_block(parent_hash = parent_hash, referee = [], txs = block_txs)
+        self.log.info(f"block {hash} created with {num_txs} transactions")
+
+        # generate some more blocks to ensure our block is executed
+        # and the corresponding witness is available on the light node
+        self.rpc[FULLNODE0].generate_blocks(30)
 
         self.log.info(f"Pass 1 - all txs relayed\n")
         # ------------------------------------------------
