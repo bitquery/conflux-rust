@@ -803,6 +803,7 @@ impl Cfx for CfxHandler {
         fn estimate_gas_and_collateral(&self, request: CallRequest, epoch_num: Option<EpochNumber>) -> RpcResult<EstimateGasAndCollateralResponse>;
         fn gas_price(&self) -> RpcResult<U256>;
         fn get_block_reward_info(&self, num: EpochNumber) -> RpcResult<Vec<RpcRewardInfo>>;
+        fn transaction_receipts_by_block_hash(&self, block_hash: H256) -> BoxFuture<Vec<RpcReceipt>>;
         fn interest_rate(&self, num: Option<EpochNumber>) -> RpcResult<U256>;
     }
 }

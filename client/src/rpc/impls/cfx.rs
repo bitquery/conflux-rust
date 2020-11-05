@@ -580,6 +580,33 @@ impl RpcImpl {
         self.prepare_receipt(hash)
     }
 
+
+    fn transaction_receipts_by_block_hash(
+            &self, block_hash: H256
+        ) -> RpcResult<Vec<RpcReceipt>> {
+        let hash: H256 = block_hash;
+        info!("RPC Request: cfx_getTransactionReceiptsByBlockHash({:?})", hash);
+
+            if let Some(block) = self
+                .consensus
+                .get_data_manager()
+                .block_from_db(&hash)
+            {
+                let mut receipts = Vec::new();
+
+                for transaction in &block.transactions {
+                    if let Some(Some(receipt)) = self.prepare_receipt(transaction.hash).ok() {
+                        receipts.push(receipt);
+                    }
+                }
+                Ok(receipts)
+
+            }else {
+                bail!(invalid_params("block_hash", String::from("Block not found by block_hash")))
+            }
+
+    }
+
     fn generate_empty_blocks(&self, num_blocks: usize) -> RpcResult<Vec<H256>> {
         info!("RPC Request: generate({:?})", num_blocks);
         let mut hashes = Vec::new();
@@ -1141,6 +1168,7 @@ impl Cfx for CfxHandler {
                 -> BoxFuture<Option<H256>>;
             fn transaction_by_hash(&self, hash: H256) -> BoxFuture<Option<RpcTransaction>>;
             fn transaction_receipt(&self, tx_hash: H256) -> BoxFuture<Option<RpcReceipt>>;
+            fn transaction_receipts_by_block_hash(&self, block_hash: H256) -> BoxFuture<Vec<RpcReceipt>>;
             fn storage_root(&self, address: H160, epoch_num: Option<EpochNumber>) -> BoxFuture<Option<StorageRoot>>;
         }
     }
