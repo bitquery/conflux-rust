@@ -194,6 +194,11 @@ pub trait Cfx {
         &self, tx_hash: H256,
     ) -> BoxFuture<Option<RpcReceipt>>;
 
+   #[rpc(name = "cfx_getTransactionReceiptsByBlockHash")]
+    fn transaction_receipts_by_block_hash(
+        &self, block_hash: H256,
+    ) -> BoxFuture<Vec<RpcReceipt>>;
+
     /// Return account related states of the given account
     #[rpc(name = "cfx_getAccount")]
     fn account(
